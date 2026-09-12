@@ -20,13 +20,13 @@ namespace AAEmu.Game.Models.Game.Skills.Effects.SpecialEffects;
 /// for socket N.
 /// </para>
 /// <para>
-/// One stone and <c>value1</c> labor (200 on every shipped stone) per changed socket. The labor is
-/// what the stone's description says and what the tab shows next to its button. The stone count
-/// comes from the tab itself, which stops taking ticks once they equal the stones in the bag. The
-/// stones are not <c>use_skill_as_reagent</c> and their skill rows carry no
-/// <c>consume_source_item</c>, so the skill system leaves them in the bag and this effect takes
-/// them. The piece goes out on the item detail packet, the way seating does, and the socketing
-/// result packet closes the tab's run.
+/// One stone and <c>value1</c> labor per changed socket (200 on every shipped stone but 46428,
+/// which asks 50). The labor is what the stone's description says and what the tab shows next
+/// to its button. The stone count comes from the tab itself, which stops taking ticks once they
+/// equal the stones in the bag. The stones are not <c>use_skill_as_reagent</c> and their skill
+/// rows carry no <c>consume_source_item</c>, so the skill system leaves them in the bag and this
+/// effect takes them. The piece goes out on the item detail packet, the way seating does, and the
+/// socketing result packet closes the tab's run.
 /// </para>
 /// </remarks>
 public class ItemSocketChange : SpecialEffectAction
