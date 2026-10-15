@@ -1759,6 +1759,10 @@ impl crate::systems::npcs::hooks::EconomyBridge for EconomyForNpcs {
         server.systems.economy.loot.item_count(npc.obj_id) > 0
     }
 
+    fn forget_loot(&self, server: &GameServer, obj_id: u32) {
+        server.systems.economy.loot.forget(obj_id);
+    }
+
     fn item_template_and_ucc(&self, server: &GameServer, item_id: u64) -> Option<(u32, u64)> {
         server
             .items

@@ -419,6 +419,15 @@ pub fn forget_object(server: &GameServer, obj_id: u32) {
     server.systems.npcs.spawns.forget_object(obj_id);
 }
 
+/// Drops spawn bookkeeping and loot belonging to a retired NPC. Call before releasing its
+/// ID so cleanup cannot remove the next NPC's container after that ID is reused.
+pub fn forget_npc_object(server: &GameServer, obj_id: u32) {
+    forget_object(server, obj_id);
+    if let Some(economy) = server.systems.npcs.hooks.economy.get() {
+        economy.forget_loot(server, obj_id);
+    }
+}
+
 /// Resets the `Respawn` / `Despawn` fields of a freshly created object (its id may be reused).
 pub fn forget_object_fields(server: &GameServer, obj_id: u32) {
     let s = &server.systems.npcs.spawns;
@@ -1791,8 +1800,8 @@ impl SpawnManager {
                 // The looted corpse can disappear before its respawn timer. Reserve
                 // its ID until both timers finish so another NPC cannot replace the
                 // pending entry or supply a different live deadline under the same ID.
+                forget_npc_object(server, e.obj.obj_id());
                 server.ids.object.release_id(e.obj.obj_id());
-                forget_object(server, e.obj.obj_id());
             }
         }
 
@@ -1825,8 +1834,12 @@ impl SpawnManager {
                 .get(&e.obj.obj_id())
                 .is_some_and(|r| matches!(r.link, SpawnerLink::Npc(_)) && r.obj.same(&e.obj))
             {
+                if matches!(&e.obj, WorldObject::Npc(_)) {
+                    forget_npc_object(server, e.obj.obj_id());
+                } else {
+                    forget_object(server, e.obj.obj_id());
+                }
                 server.ids.object.release_id(e.obj.obj_id());
-                forget_object(server, e.obj.obj_id());
             }
             Self::remove_entry(&self.despawns, &e);
         }
@@ -1905,8 +1918,8 @@ impl SpawnManager {
                     }
                     self.cancel_npc_timers(&npc);
                     spawner.despawn(server, &npc);
+                    forget_npc_object(server, npc.obj_id);
                     server.ids.object.release_id(npc.obj_id);
-                    forget_object(server, npc.obj_id);
                 }
             }
         }
@@ -1964,8 +1977,8 @@ impl SpawnManager {
             // Drop the queue locks before the world / object locks (as `check_respawns_tick`).
             let corpse_pending = self.despawns.lock().expect("poisoned").contains_key(&id);
             if !corpse_pending && self.world.object(id).is_none() {
+                forget_npc_object(server, id);
                 server.ids.object.release_id(id);
-                forget_object(server, id);
             }
             // All same-placement deadlines are gone, so each linked clone's credits are stale.
             if let SpawnerLink::Npc(s) = &e.link {

@@ -96,7 +96,10 @@ fn member(id: u32, spawner: u32, npc: u32) -> NpcSpawnerNpc {
 /// Spawner templates: 1 (Test Warrior, fake template source), 10 (NPC 500), 20 + 21 (NPC 600,
 /// two spawners), 30 (NPC 700, 2 members of an unsupported type + one valid).
 fn server() -> Arc<GameServer> {
-    let mut data = GameData::empty();
+    server_with_data(GameData::empty())
+}
+
+fn server_with_data(mut data: GameData) -> Arc<GameServer> {
     data.items.templates.insert(
         crate::data::items::ITEM_COINS,
         crate::data::items::ItemTemplate::plain(crate::data::items::ITEM_COINS, i32::MAX),
@@ -531,6 +534,342 @@ async fn fully_looted_corpse_uses_shortened_deadline_and_respawn_keeps_its_own_t
     spawn_manager::active_region_tick(&server);
     assert_eq!(spawner.current_spawn_count(), 1);
     server.ids.object.release_id(other_id);
+}
+
+/// Synthetic guaranteed 7-coin loot data for NPC 500 (loot id 1, pack 77), shared by the
+/// object-id-reuse loot regressions.
+fn guaranteed_coin_data() -> GameData {
+    use crate::data::items::{LootPackDroppingNpc, ITEM_COINS};
+    use crate::systems::economy::loot_data::{Loot, LootPack};
+
+    let mut data = GameData::empty();
+    data.items.loot_pack_dropping_npc.insert(
+        500,
+        vec![LootPackDroppingNpc {
+            id: 1,
+            npc_id: 500,
+            loot_pack_id: 77,
+            default_pack: false,
+        }],
+    );
+    let loot = Loot {
+        id: 1,
+        item_id: ITEM_COINS,
+        drop_rate: 10_000_000,
+        min_amount: 7,
+        max_amount: 7,
+        loot_pack_id: 77,
+        always_drop: true,
+        ..Loot::default()
+    };
+    data.systems.economy.loot.packs.insert(
+        77,
+        LootPack {
+            id: 77,
+            loots: vec![loot],
+            loots_by_group_no: vec![(0, vec![loot])],
+            ..LootPack::default()
+        },
+    );
+    data
+}
+
+async fn loot_after_object_id_reuse(respawn_time: i32, loot_first: bool) {
+    use crate::systems::economy::bridges::EconomyForNpcs;
+    use crate::systems::economy::looting::LootManager;
+
+    let server = server_with_data(guaranteed_coin_data());
+    super::install_hooks(&server);
+    server
+        .systems
+        .npcs
+        .hooks
+        .economy
+        .install(Arc::new(EconomyForNpcs));
+    let m = manager(&server);
+    m.add_npc_spawner(&server, npc_def(500, 300.0, 300.0))
+        .unwrap();
+    let spawner = m.get_all_spawners().into_values().flatten().next().unwrap();
+    let mut alice_client = TestClient::new(&server, 1, 1);
+    let alice = spawn_player(
+        &server,
+        &alice_client,
+        test_character(1, "Alice", 300.0, 300.0),
+        5000,
+    );
+    let mut bob_client = TestClient::new(&server, 2, 2);
+    let bob = spawn_player(
+        &server,
+        &bob_client,
+        test_character(2, "Bob", 300.0, 300.0),
+        5001,
+    );
+    bob.data().money = 0;
+    spawn_manager::active_region_tick(&server);
+    let world = server.world.world(0).unwrap();
+    let first = world.all_npcs().pop().unwrap();
+    spawner.set_respawn_time(respawn_time);
+    first.data().unit.hp = 0;
+    super::npc::death::do_die(&server, &first, Some(&WorldObject::from(&alice)), 0);
+    let old_loot = server.systems.economy.loot.get(first.obj_id).unwrap();
+    assert_eq!(old_loot.lock().unwrap().items[&1].item.count, 7);
+    LootManager::open_bag(&server, &alice, first.obj_id, false);
+    assert_eq!(old_loot.lock().unwrap().opened_by, vec![alice.character_id]);
+    if loot_first {
+        // Looting preserves the original minimum corpse lifetime. Age this fixture past that
+        // minimum to exercise the shortened 2 s deadline without a real-time sleep.
+        old_loot.lock().unwrap().creation_time_ms = chrono::Utc::now().timestamp_millis() - 30_000;
+        assert!(LootManager::try_take_loot(
+            &server,
+            &alice,
+            first.obj_id,
+            1,
+            false
+        ));
+        assert!(old_loot.lock().unwrap().items.is_empty());
+    }
+
+    // Unlooted corpses last 320 s; fully looted corpses last 2 s. Exercise both timer orders
+    // without allocating an ID manually or clearing the loot cache in the test.
+    let corpse_wait = if loot_first { 3 } else { 321 };
+    advance(corpse_wait);
+    m.check_respawns_tick(&server);
+    assert!(world.npc(first.obj_id).is_none());
+    if respawn_time > corpse_wait as i32 {
+        assert_eq!(m.pending_respawns().len(), 1);
+        spawn_manager::active_region_tick(&server);
+        assert!(world.all_npcs().is_empty(), "respawn still pending");
+        advance(respawn_time as u64 + 1 - corpse_wait);
+        m.check_respawns_tick(&server);
+    }
+    assert!(m.pending_respawns().is_empty());
+    assert!(m.pending_despawns().is_empty());
+    spawn_manager::active_region_tick(&server);
+    let second = world.all_npcs().pop().unwrap();
+    assert_eq!(
+        second.obj_id, first.obj_id,
+        "released ID reused by the real spawner"
+    );
+    assert!(!Arc::ptr_eq(&first, &second));
+    second.data().unit.hp = 0;
+    super::npc::death::do_die(&server, &second, Some(&WorldObject::from(&bob)), 0);
+    let new_loot = server.systems.economy.loot.get(second.obj_id).unwrap();
+    assert!(
+        !Arc::ptr_eq(&old_loot, &new_loot),
+        "new NPC needs fresh loot"
+    );
+    {
+        let loot = new_loot.lock().unwrap();
+        assert!(loot.already_generated);
+        assert_eq!(loot.items[&1].item.count, 7);
+        assert_eq!(loot.eligible_players, vec![bob.character_id]);
+        assert!(
+            loot.opened_by.is_empty(),
+            "previous corpse's viewers discarded"
+        );
+    }
+    // Repeated ticks and generation must retain this corpse's one container and its killer.
+    m.check_respawns_tick(&server);
+    LootManager::generate_loot(
+        &server,
+        &WorldObject::from(&second),
+        Some(&WorldObject::from(&alice)),
+    );
+    assert!(Arc::ptr_eq(
+        &new_loot,
+        &server.systems.economy.loot.get(second.obj_id).unwrap()
+    ));
+    assert_eq!(
+        new_loot.lock().unwrap().eligible_players,
+        vec![bob.character_id]
+    );
+    alice_client.drain();
+    bob_client.drain();
+    LootManager::open_bag(&server, &bob, second.obj_id, false);
+    assert!(bob_client
+        .drain_ops()
+        .contains(&crate::opcodes::sc::SCLootBagDataPacket));
+    assert!(
+        alice_client.drain().is_empty(),
+        "old viewers receive no new loot"
+    );
+    assert!(LootManager::try_take_loot(
+        &server,
+        &bob,
+        second.obj_id,
+        1,
+        false
+    ));
+    assert_eq!(bob.data().money, 7);
+    assert_eq!(server.systems.economy.loot.item_count(second.obj_id), 0);
+    if loot_first {
+        assert!(old_loot.lock().unwrap().items.is_empty());
+    } else {
+        assert_eq!(old_loot.lock().unwrap().items[&1].item.count, 7);
+    }
+}
+
+#[tokio::test]
+async fn loot_after_object_id_reuse_with_respawn_before_corpse_cleanup() {
+    loot_after_object_id_reuse(10, false).await;
+}
+
+#[tokio::test]
+async fn loot_after_object_id_reuse_with_corpse_cleanup_before_respawn() {
+    loot_after_object_id_reuse(340, false).await;
+}
+
+#[tokio::test]
+async fn loot_after_object_id_reuse_with_fully_looted_corpse() {
+    loot_after_object_id_reuse(10, true).await;
+}
+
+/// Distance reclamation of a cold NPC must retire its loot container with the recycled object
+/// id: the id-reusing replacement gets a fresh container, fresh eligibility and no viewers of
+/// the reclaimed NPC.
+#[tokio::test]
+async fn loot_after_object_id_reuse_with_cold_reclamation() {
+    use crate::systems::economy::bridges::EconomyForNpcs;
+    use crate::systems::economy::looting::LootManager;
+
+    let server = server_with_data(guaranteed_coin_data());
+    super::install_hooks(&server);
+    server
+        .systems
+        .npcs
+        .hooks
+        .economy
+        .install(Arc::new(EconomyForNpcs));
+    // Retention 0 reclaims the healthy NPC in the leaving pass (the real reclamation path).
+    server
+        .config
+        .update(|c| c.world.npc_warm_retention_seconds = 0);
+    let m = manager(&server);
+    m.add_npc_spawner(&server, npc_def(500, 100.0, 100.0))
+        .unwrap();
+    let spawner = only_spawner(&m);
+    let mut alice_client = TestClient::new(&server, 1, 1);
+    let alice = spawn_player(
+        &server,
+        &alice_client,
+        test_character(1, "Alice", 100.0, 100.0),
+        5000,
+    );
+    let world = server.world.world(0).unwrap();
+
+    assert_eq!(activate(&server).created, 1);
+    let first = spawner
+        .spawned_npcs()
+        .into_values()
+        .flatten()
+        .next()
+        .unwrap();
+    let first_id = first.obj_id;
+
+    // Cache-lifetime fixture: an explicitly generated container for the living NPC (loot is
+    // not normally generated while the NPC is alive) with the original eligibility and viewer.
+    LootManager::generate_loot(
+        &server,
+        &WorldObject::from(&first),
+        Some(&WorldObject::from(&alice)),
+    );
+    let old_loot = server.systems.economy.loot.get(first_id).unwrap();
+    {
+        let loot = old_loot.lock().unwrap();
+        assert!(loot.already_generated);
+        assert_eq!(loot.items[&1].item.count, 7);
+        assert_eq!(loot.eligible_players, vec![alice.character_id]);
+    }
+    LootManager::open_bag(&server, &alice, first_id, false);
+    assert_eq!(old_loot.lock().unwrap().opened_by, vec![alice.character_id]);
+
+    // The only player leaves the warm region: the healthy NPC is reclaimed in place with no
+    // leftover corpse / respawn timer, and its loot cache retires with it.
+    leave_world(&server, &alice);
+    let stats = activate(&server);
+    assert_eq!(stats.reclaimed, 1, "healthy cold NPC reclaimed");
+    m.check_respawns_tick(&server);
+    assert!(world.npc(first_id).is_none());
+    assert!(m.pending_respawns().is_empty());
+    assert!(m.pending_despawns().is_empty(), "no leftover timers");
+    assert!(
+        server.systems.economy.loot.get(first_id).is_none(),
+        "cold reclamation retires the loot cache before the id is reused"
+    );
+
+    // A different player returns; the real spawner reuses the released id for a distinct NPC.
+    let mut bob_client = TestClient::new(&server, 2, 2);
+    let bob = spawn_player(
+        &server,
+        &bob_client,
+        test_character(2, "Bob", 100.0, 100.0),
+        5001,
+    );
+    bob.data().money = 0;
+    assert_eq!(activate(&server).created, 1);
+    let second = spawner
+        .spawned_npcs()
+        .into_values()
+        .flatten()
+        .next()
+        .unwrap();
+    assert_eq!(
+        second.obj_id, first_id,
+        "released ID reused by the real spawner"
+    );
+    assert!(!Arc::ptr_eq(&first, &second));
+
+    second.data().unit.hp = 0;
+    super::npc::death::do_die(&server, &second, Some(&WorldObject::from(&bob)), 0);
+    let new_loot = server.systems.economy.loot.get(second.obj_id).unwrap();
+    assert!(
+        !Arc::ptr_eq(&old_loot, &new_loot),
+        "new NPC needs fresh loot"
+    );
+    {
+        let loot = new_loot.lock().unwrap();
+        assert!(loot.already_generated);
+        assert_eq!(loot.items[&1].item.count, 7);
+        assert_eq!(loot.eligible_players, vec![bob.character_id]);
+        assert!(
+            loot.opened_by.is_empty(),
+            "previous corpse's viewers discarded"
+        );
+    }
+    // Repeated ticks and generation must retain this corpse's one container and its killer.
+    m.check_respawns_tick(&server);
+    LootManager::generate_loot(
+        &server,
+        &WorldObject::from(&second),
+        Some(&WorldObject::from(&alice)),
+    );
+    assert!(Arc::ptr_eq(
+        &new_loot,
+        &server.systems.economy.loot.get(second.obj_id).unwrap()
+    ));
+    assert_eq!(
+        new_loot.lock().unwrap().eligible_players,
+        vec![bob.character_id]
+    );
+    alice_client.drain();
+    bob_client.drain();
+    LootManager::open_bag(&server, &bob, second.obj_id, false);
+    assert!(bob_client
+        .drain_ops()
+        .contains(&crate::opcodes::sc::SCLootBagDataPacket));
+    assert!(
+        alice_client.drain().is_empty(),
+        "old viewers receive no new loot"
+    );
+    assert!(LootManager::try_take_loot(
+        &server,
+        &bob,
+        second.obj_id,
+        1,
+        false
+    ));
+    assert_eq!(bob.data().money, 7, "fresh guaranteed coin award");
+    assert_eq!(server.systems.economy.loot.item_count(second.obj_id), 0);
 }
 
 #[tokio::test]

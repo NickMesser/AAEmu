@@ -14,6 +14,27 @@ impl Despawn {
 
 /// `ObjectIdManager.Instance.ReleaseId(obj.ObjId); obj.Delete();`
 fn release_and_delete(server: &GameServer, obj: &WorldObject) {
+    if let WorldObject::Npc(npc) = obj {
+        // Serialize with the corpse timers: an old deadline must not delete a replacement
+        // after this command returns the ID to the allocator.
+        let _serial = server.systems.npcs.spawns.spawn_lock();
+        let Some(world) = server.world.world_of(obj) else {
+            return;
+        };
+        if !world
+            .npc(npc.obj_id)
+            .is_some_and(|current| Arc::ptr_eq(&current, npc))
+        {
+            return;
+        }
+        if let Some(manager) = server.systems.npcs.spawns.get(world.id) {
+            manager.cancel_npc_timers(npc);
+        }
+        spawn_manager::delete_object(server, obj, Some(world.id));
+        spawn_manager::forget_npc_object(server, npc.obj_id);
+        server.ids.object.release_id(npc.obj_id);
+        return;
+    }
     server.ids.object.release_id(obj.obj_id());
     spawn_manager::delete_object(server, obj, None);
 }
@@ -176,6 +197,71 @@ impl Command for Despawn {
 mod tests {
     use super::super::harness;
     use super::super::util::objects_test_support as ts;
+
+    #[tokio::test]
+    async fn despawn_npc_retires_loot_and_timers_before_object_id_reuse() {
+        use crate::systems::economy::bridges::EconomyForNpcs;
+        use crate::systems::economy::looting::LootManager;
+        use crate::systems::npcs::spawn_manager;
+        use crate::world::WorldObject;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        for by_radius in [false, true] {
+            let server = ts::server();
+            server
+                .systems
+                .npcs
+                .hooks
+                .economy
+                .install(Arc::new(EconomyForNpcs));
+            let gm = harness::pc(&server, 1, "Gm", 100.0, 100.0);
+            let world = server.world.world(0).unwrap();
+            let manager = server.systems.npcs.spawns.get_or_create(&world);
+            let npc = ts::spawn_npc(&server, ts::NPC, 110.0, 100.0);
+            let owner = WorldObject::from(&npc);
+            LootManager::generate_loot(&server, &owner, Some(&WorldObject::from(&gm.p)));
+            let old_loot = server.systems.economy.loot.get(npc.obj_id).unwrap();
+            assert!(old_loot.lock().unwrap().already_generated);
+            LootManager::open_bag(&server, &gm.p, npc.obj_id, false);
+            manager.add_respawn(&server, owner.clone(), Some(spawn_manager::now()));
+            manager.add_despawn(&server, owner, Some(spawn_manager::now()));
+            let command = if by_radius {
+                format!("despawn npc {} 20", ts::NPC)
+            } else {
+                format!("despawn npc {}", npc.obj_id)
+            };
+            let (handled, _) = harness::run(&server, &gm.p, &command).await;
+            assert!(handled);
+            assert!(world.npc(npc.obj_id).is_none());
+            assert!(
+                server.systems.economy.loot.get(npc.obj_id).is_none(),
+                "GM despawn must retire loot"
+            );
+            assert!(manager.pending_respawns().is_empty());
+            assert!(manager.pending_despawns().is_empty());
+            let replacement = ts::spawn_npc(&server, ts::NPC, 110.0, 100.0);
+            assert_eq!(replacement.obj_id, npc.obj_id);
+            LootManager::generate_loot(
+                &server,
+                &WorldObject::from(&replacement),
+                Some(&WorldObject::from(&gm.p)),
+            );
+            let new_loot = server.systems.economy.loot.get(replacement.obj_id).unwrap();
+            assert!(!Arc::ptr_eq(&old_loot, &new_loot));
+            assert!(new_loot.lock().unwrap().opened_by.is_empty());
+            spawn_manager::advance_test_clock(Duration::from_secs(1));
+            manager.check_respawns_tick(&server);
+            assert!(Arc::ptr_eq(
+                &replacement,
+                &world.npc(replacement.obj_id).unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &new_loot,
+                &server.systems.economy.loot.get(replacement.obj_id).unwrap()
+            ));
+        }
+    }
 
     #[tokio::test]
     async fn despawn_by_id_and_radius() {

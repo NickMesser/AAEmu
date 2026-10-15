@@ -230,6 +230,9 @@ pub trait EconomyBridge: Send + Sync {
         false
     }
 
+    /// Drops loot for a retired object before its ID is returned to the allocator.
+    fn forget_loot(&self, _server: &GameServer, _obj_id: u32) {}
+
     /// `ItemManager.Instance.GetItemByItemId(itemId)?.TemplateId` / `.UccId`.
     fn item_template_and_ucc(&self, _server: &GameServer, _item_id: u64) -> Option<(u32, u64)> {
         None
