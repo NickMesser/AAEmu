@@ -589,8 +589,8 @@ fn cleanup_npcs(server: &GameServer, world_id: u32, npcs: Vec<NpcRef>, keep_corp
         } else {
             spawn_manager::delete_object(server, &WorldObject::from(&npc), Some(world_id));
         }
+        spawn_manager::forget_npc_object(server, npc.obj_id);
         server.ids.object.release_id(npc.obj_id);
-        spawn_manager::forget_object(server, npc.obj_id);
     }
 }
 

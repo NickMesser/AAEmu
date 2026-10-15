@@ -1152,8 +1152,8 @@ impl NpcSpawner {
         }
         self.remove_npc_from_spawned_list(server, npc);
         spawn_manager::delete_object(server, &WorldObject::from(npc), self.parent_world());
+        spawn_manager::forget_npc_object(server, npc.obj_id);
         server.ids.object.release_id(npc.obj_id);
-        spawn_manager::forget_object(server, npc.obj_id);
         tracing::debug!(
             "Reclaimed cold NPC {}:{}:{}.",
             self.unit_id,
@@ -1351,8 +1351,8 @@ impl NpcSpawner {
                         &WorldObject::from(npc),
                         self.parent_world(),
                     );
+                    spawn_manager::forget_npc_object(server, npc.obj_id);
                     server.ids.object.release_id(npc.obj_id);
-                    spawn_manager::forget_object(server, npc.obj_id);
                 }
                 *remaining -= keep as i64;
                 keep
